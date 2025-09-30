@@ -33,27 +33,32 @@ SQL_GENERATOR_PROMPT = f"""Você é um expert em GoogleSQL (SQL do BigQuery). Su
 O esquema da tabela é:
 {TABLE_SCHEMA_DESCRIPTION}
 
+--- INÍCIO DA ATUALIZAÇÃO ---
+**Regra de Ouro:** Use **EXCLUSIVAMENTE** os nomes de colunas fornecidos no esquema acima. Não infira ou utilize qualquer outro nome de coluna ou pseudo-coluna (como `_PARTITIONTIME`). Todos os filtros e seleções devem se referir a colunas existentes no esquema.
+--- FIM DA ATUALIZAÇÃO ---
+
 **Métricas Calculadas (Fórmulas):**
 Quando o usuário pedir por uma métrica que não é uma coluna direta, use estas fórmulas para calculá-la. Use `SUM()` para agregar custos e contagens.
 
-- **CPM (Custo por Mil Impressões):** `(SUM(Cost) / SUM(Impressions)) * 1000`
-- **CTR (Taxa de Cliques):** `(SUM(Clicks) / SUM(Impressions)) * 100`
-- **CPC (Custo por Clique):** `SUM(Cost) / SUM(Clicks)`
-- **CPView 100% ou CPV (Custo por View Completa):** `SUM(Cost) / SUM(VideoViews100)`
-- **VTR 100% (Taxa de Visualização Completa):** `(SUM(VideoViews100) / SUM(Impressions)) * 100`
+- **CPM:** `(SUM(Cost) / SUM(Impressions)) * 1000`
+- **CTR:** `(SUM(Clicks) / SUM(Impressions)) * 100`
+- **CPC:** `SUM(Cost) / SUM(Clicks)`
+- **CPView 100% ou CPV:** `SUM(Cost) / SUM(VideoViews100)`
+- **VTR 100%:** `(SUM(VideoViews100) / SUM(Impressions)) * 100`
 
-**Regras:**
-1.  **Análise para Otimização:** Se a pergunta for sobre otimização, rentabilização ou comparação (ex: 'como melhorar', 'qual o melhor', 'compare'), não retorne apenas um número. Em vez disso, retorne a métrica principal AGRUPADA pelas dimensões mais relevantes para a análise (como `Segmentacao`, `LinhaCriativa`, `Formato`, `Plataforma`).
-2.  **Análise de Tendência:** Se a pergunta envolver "tendência", "evolução", "histórico" ou "ao longo do tempo", gere uma consulta que agrupe a métrica por um período de tempo, usando `DATE_TRUNC(data, MONTH)` para agrupar por mês, ou `data` para agrupar por dia, e ordene o resultado por data. A coluna de data se chama `data`.
-3.  Responda APENAS com o código SQL. Não inclua explicações ou markdown.
-4.  Use a cláusula `WHERE` sempre que possível para filtrar os dados.
-5.  **Filtros Flexíveis e Sinônimos:** Para colunas de texto, aplique filtros flexíveis (`LOWER(coluna) LIKE '%termo%'`). Aplique isso para: `Campanha`, `Plataforma`, `Segmentacao` (sinônimos: audiência), `Canal`, `ObjetivoDeMidia`, `ObjetivodeComunicacao`, `PrecisionMkt` (sinônimos: precision, pm).
+**Regras de Geração:**
+1.  **Análise para Otimização:** Se a pergunta for sobre otimização ou comparação, retorne a métrica principal AGRUPADA pelas dimensões mais relevantes.
+2.  **Análise de Tendência:** Se a pergunta envolver "tendência" ou "evolução", agrupe a métrica por `DATE_TRUNC(data, MONTH)` (para mês) ou `data` (para dia), e ordene pela data. A coluna de data se chama `data`.
+3.  Responda APENAS com o código SQL.
+4.  Use a cláusula `WHERE` sempre que possível.
+5.  **Filtros Flexíveis e Sinônimos:** Aplique filtros flexíveis (`LOWER(coluna) LIKE '%termo%'`) para: `Campanha`, `Plataforma`, `Segmentacao` (sinônimos: audiência), `Canal`, `ObjetivoDeMidia`, `ObjetivodeComunicacao`, `PrecisionMkt` (sinônimos: precision, pm).
 6.  A data de hoje é {pd.Timestamp.now().strftime('%Y-%m-%d')}.
 
 Pergunta do usuário:
 """
 
 # --- MODELOS GEMINI ---
+# (O resto do código continua exatamente o mesmo)
 sql_model = genai.GenerativeModel('gemini-2.5-flash')
 analysis_model = genai.GenerativeModel(
     'gemini-2.5-flash',
@@ -75,13 +80,11 @@ def gemini_chat(request):
     history = request_json.get('history', [])
 
     try:
-        # ETAPA 1: Gerar a consulta SQL
         sql_chat_session = sql_model.start_chat(history=history[:-1])
         sql_generation_prompt = f"{SQL_GENERATOR_PROMPT}{user_question}"
         sql_response = sql_chat_session.send_message(sql_generation_prompt)
         sql_query = sql_response.text.strip().replace('`', '')
 
-        # ETAPA 2: Executar a consulta no BigQuery
         query_job = bigquery_client.query(sql_query)
         results = query_job.to_dataframe()
         
@@ -89,22 +92,13 @@ def gemini_chat(request):
             final_answer = "Não encontrei dados para a sua pergunta. Por favor, tente refinar sua busca ou verifique os filtros aplicados."
             suggestions = ["Qual o investimento total no último mês?", "Compare o CTR de todas as plataformas."]
         else:
-            # ETAPA 3: Enviar os dados para a persona analisar
             data_as_string = results.to_csv(index=False)
-            analysis_prompt = (
-                f"Com base nos seguintes dados extraídos do BigQuery em formato CSV:\n\n"
-                f"{data_as_string}\n\n"
-                f"Responda à pergunta original do usuário de forma clara e analítica: '{user_question}'.\n\n"
-                f"---FIM DA ANÁLISE---\n"
-                f"Agora, adicione o separador `###SUGESTÕES###` e, em uma nova linha, sugira 2 ou 3 perguntas de acompanhamento relevantes que um analista faria a seguir. Não adicione nenhum outro texto após as sugestões."
-            )
+            analysis_prompt = (f"Com base nos seguintes dados extraídos do BigQuery em formato CSV:\n\n{data_as_string}\n\nResponda à pergunta original do usuário de forma clara, analítica e proativa, sugerindo otimizações: '{user_question}'.\n\n---FIM DA ANÁLISE---\nAgora, adicione o separador `###SUGESTÕES###` e, em uma nova linha, sugira 2 ou 3 perguntas de acompanhamento relevantes que um analista faria a seguir. Não adicione nenhum outro texto após as sugestões.")
             final_response = analysis_model.generate_content(analysis_prompt)
             
-            # Lógica para separar a resposta principal das sugestões
             if '###SUGESTÕES###' in final_response.text:
                 parts = final_response.text.split('###SUGESTÕES###')
                 final_answer = parts[0].strip()
-                # Extrai as perguntas que começam com um padrão (número, letra, -, *, etc.) e terminam com '?'
                 suggestions = re.findall(r'[\d\.\-\*\s]*([A-Z][^?]*\?)', parts[1])
                 suggestions = [s.strip() for s in suggestions]
             else:
