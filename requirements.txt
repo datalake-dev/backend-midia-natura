@@ -3,3 +3,4 @@ google-generativeai==0.5.0
 google-cloud-bigquery
 pandas
 db-dtypes
+google-cloud-bigquery-storage
