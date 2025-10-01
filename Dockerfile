@@ -4,6 +4,11 @@ FROM python:3.12-slim
 # Defina o diretório de trabalho no contêiner
 WORKDIR /app
 
+# --- ADIÇÃO PARA COMPILAR DEPENDÊNCIAS COMPLEXAS ---
+# Instala as ferramentas de compilação necessárias (como gcc) antes de instalar as bibliotecas Python
+RUN apt-get update && apt-get install -y build-essential
+# --- FIM DA ADIÇÃO ---
+
 # Copie o arquivo de dependências para o diretório de trabalho
 COPY requirements.txt .
 
