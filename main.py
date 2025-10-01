@@ -5,7 +5,6 @@ import google.generativeai as genai
 from flask import jsonify
 from google.cloud import bigquery
 import pandas as pd
-import traceback
 
 # --- CONFIGURAÇÕES DO PROJETO ---
 PROJECT_ID = "africa-br"
@@ -17,43 +16,29 @@ CAMPAIGN_FILTER = "tododia-havana"
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 bigquery_client = bigquery.Client(project=PROJECT_ID)
 
-# --- PROMPT DE ANÁLISE PROATIVA ---
+# --- PROMPT DE ANÁLISE PROATIVA (AJUSTADO PARA CSV) ---
 ANALYSIS_PROMPT_TEMPLATE = """Você é um especialista sênior em análise de mídia paga da agência, encarregado de analisar a performance da campanha '{campaign}' para o cliente Natura.
 
 **Sua Missão:**
-Com base no resumo de dados da campanha fornecido abaixo (formato JSON), gere de 5 a 7 insights estratégicos e criativos sobre os resultados.
+Com base em uma amostra representativa dos dados da campanha fornecida abaixo (formato CSV), sua tarefa é gerar de 5 a 7 insights estratégicos e criativos. Identifique os principais destaques, padrões e anomalias.
 
-**Contexto de Negócio Importante:**
-- A coluna `PrecisionMkt` indica se a linha é otimizável. 'PM' (Precision Marketing) significa que a compra é de leilão e pode ter seus lances otimizados. 'NPM' (Non-Precision Marketing) significa que a compra é de reserva (ex: TopView do TikTok) e não é otimizável via leilão. Suas recomendações devem levar essa diferença fundamental em consideração.
+**Tom de Voz e Estrutura:**
+- Vá direto ao primeiro insight, sem introduções.
+- Use Markdown e finalize com uma Recomendação Estratégica Geral.
+- Leve em conta o contexto de negócio da coluna 'PrecisionMkt' (PM = otimizável, NPM = não otimizável).
 
-**Tom de Voz:**
-- **Direto e Profissional:** Comunique-se de forma clara e objetiva, como um analista apresentando resultados para a equipe.
-- **Evite Formalidades Excessivas:** Não use saudações como "Prezado(a)".
-
-**Estrutura da Resposta:**
-- **Comece a resposta DIRETAMENTE pelo primeiro insight (ex: "1. Destaque sobre...").** Não use nenhuma introdução ou parágrafo de apresentação.
-- Use Markdown para formatação (negrito, listas numeradas).
-- Organize os insights em uma lista numerada.
-- Finalize com uma **"Recomendação Estratégica Geral"**.
-
-**Dados da Campanha (JSON):**
+**Dados da Campanha (Amostra em CSV):**
 {data_from_bq}
 
 **Gere sua análise agora, começando pelo Insight 1.**
 """
 
-# --- CONSULTA SQL FIXA E OTIMIZADA ---
+# (A CONSULTA SQL FIXA CONTINUA A MESMA)
 FIXED_SQL_QUERY = f"""
 SELECT
-    Plataforma,
-    Segmentacao,
-    LinhaCriativa,
-    Formato,
-    PrecisionMkt,
-    SUM(Cost) as CustoTotal,
-    SUM(Impressions) as Impressoes,
-    SUM(Clicks) as Cliques,
-    SUM(VideoViews100) as ViewsCompletas
+    Plataforma, Segmentacao, LinhaCriativa, Formato, PrecisionMkt,
+    SUM(Cost) as CustoTotal, SUM(Impressions) as Impressoes,
+    SUM(Clicks) as Cliques, SUM(VideoViews100) as ViewsCompletas
 FROM
     `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
 WHERE
@@ -72,8 +57,7 @@ def gemini_chat(request):
     headers = {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Credentials': 'true'
+        'Access-Control-Allow-Headers': 'Content-Type'
     }
 
     if request.method == 'OPTIONS':
@@ -82,41 +66,38 @@ def gemini_chat(request):
     try:
         print("🚀 Iniciando análise...")
         print("→ Executando query no BigQuery...")
-
         query_job = bigquery_client.query(FIXED_SQL_QUERY)
         results = query_job.to_dataframe()
-
         print(f"✅ Query concluída. {len(results)} linhas retornadas.")
 
         if results.empty:
-            print("⚠️ Nenhum resultado encontrado (após filtro de 'deal').")
-            final_answer = f"Não encontrei dados otimizáveis para a campanha '{CAMPAIGN_FILTER}' (canais do tipo 'deal' foram excluídos da análise)."
+            final_answer = f"Não encontrei dados otimizáveis para a campanha '{CAMPAIGN_FILTER}'."
             return jsonify({'text': final_answer}), 200, headers
 
-        print("→ Formatando dados e enviando para o Gemini...")
+        print("→ Formatando dados (amostragem CSV) e enviando para o Gemini...")
 
-        rows = results.to_dict(orient='records')
-        # CORREÇÃO 1: JSON mais compacto, sem indentação
-        data_as_string = json.dumps(rows[:200], ensure_ascii=False)
+        # --- OTIMIZAÇÃO APLICADA AQUI ---
+        # Pega uma amostra aleatória de até 50 linhas para manter o prompt ágil
+        sample_size = min(50, len(results))
+        sample_df = results.sample(n=sample_size)
+        data_as_string = sample_df.to_csv(index=False)
+        # --- FIM DA OTIMIZAÇÃO ---
 
         analysis_prompt = ANALYSIS_PROMPT_TEMPLATE.format(
             campaign=CAMPAIGN_FILTER,
             data_from_bq=data_as_string
         )
 
-        print("→ Gerando resposta com Gemini (com timeout estendido)...")
-        
-        # CORREÇÃO 2: Aumenta o tempo limite da chamada para 300 segundos (5 minutos)
-        request_options = {"timeout": 300}
-        final_response = analysis_model.generate_content(analysis_prompt, request_options=request_options)
+        print("→ Gerando resposta com Gemini...")
+        final_response = analysis_model.generate_content(analysis_prompt)
+        final_answer = final_response.text
 
         print("✅ Resposta gerada com sucesso pelo Gemini.")
-
-        final_answer = final_response.text
         return jsonify({'text': final_answer}), 200, headers
 
     except Exception as e:
-        print("❌ Ocorreu um erro:")
+        print(f"❌ Ocorreu um erro: {e}")
+        import traceback
         traceback.print_exc()
         final_answer = "Desculpe, ocorreu um erro ao consultar o banco de dados e gerar os insights."
         return jsonify({'text': final_answer}), 500, headers
