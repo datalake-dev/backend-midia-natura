@@ -1,5 +1,4 @@
 import os
-import re
 import functions_framework
 import google.generativeai as genai
 from flask import make_response, jsonify
@@ -10,72 +9,85 @@ import pandas as pd
 PROJECT_ID = "africa-br"
 DATASET_ID = "NaturaProcessData"
 TABLE_ID = "PreClique"
-
-TABLE_SCHEMA_DESCRIPTION = """
-(
-    Submarca STRING, Campanha STRING, ObjetivodeComunicacao STRING, Plataforma STRING, FreeText1 STRING, ObjetivoDeMidia STRING, TipoAtivacao STRING, Estrategia STRING, Segmentacao STRING, FaixaEtaria STRING, Genero STRING, Praca STRING, Freetext2 STRING, CategoriaAd STRING, SubmarcaAd STRING, AdFront STRING, Formato STRING, Dimensao STRING, Segundagem STRING, Skippable STRING, Pilar STRING, AcaoComInfluenciador STRING, Influenciador STRING, RT1 STRING, LinhaCriativa STRING, CTA STRING, TipoDeCompra STRING, Canal STRING, PrecisionMkt STRING, ChaveGa STRING, Cost FLOAT64, Revenue FLOAT64, Impressions INT64, Clicks INT64, VideoViews INT64, ThreeSecondsVideoViews INT64, TwoSecondsVideoViews INT64, SixSecondsVideoViews INT64, VideoViews25 INT64, VideoViews50 FLOAT64, VideoViews75 INT64, VideoViews100 INT64, Comments INT64, Likes INT64, Saves INT64, Shares INT64, Follows INT64
-)
-"""
+CAMPAIGN_FILTER = "tododia-havana"
 
 # Inicializa os clientes
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 bigquery_client = bigquery.Client(project=PROJECT_ID)
 
-# --- PERSONAS E PROMPTS ---
-AGENT_PERSONA = """Você é um especialista sênior em análise de mídia paga da agência, focado exclusivamente na campanha 'Tododia Havana' para o cliente Natura. Sua missão é gerar insights claros, concisos e acionáveis em formato Markdown.
+# --- PROMPT DE ANÁLISE PROATIVA ---
+ANALYSIS_PROMPT_TEMPLATE = """Você é um especialista sênior em análise de mídia paga da agência, encarregado de analisar a performance da campanha '{campaign}' para o cliente Natura.
+
+**Sua Missão:**
+Com base no resumo de dados da campanha fornecido abaixo, sua tarefa é gerar de 5 a 7 insights estratégicos e criativos. Identifique os principais destaques (positivos e negativos), padrões e anomalias.
 
 **Tom de Voz:**
-- **Direto e Profissional:** Comunique-se de forma clara e objetiva.
-- **Evite Formalidades Excessivas:** Não use saudações como "Prezado(a)". Vá direto ao insight.
+- **Direto e Profissional:** Comunique-se de forma clara e objetiva, como um analista apresentando resultados para a equipe.
+- **Evite Formalidades Excessivas:** Não use saudações como "Prezado(a)". Vá direto aos insights.
 - **Foco em Ação:** Sua linguagem deve ser proativa, focada em apontar oportunidades e pontos de atenção.
 
 **Estrutura da Resposta:**
-1. Comece com a conclusão ou insight principal em negrito.
-2. Apresente os dados de apoio, preferencialmente em uma tabela simples.
-3. Finalize com uma **"Recomendação:"** ou **"Ponto de Atenção:"**.
+- Use Markdown para formatação (negrito, listas, etc.).
+- Organize os insights em uma lista numerada.
+- Cada insight deve ser claro e vir acompanhado de uma breve justificativa baseada nos dados.
+- Finalize com uma **"Recomendação Estratégica Geral"** com base em todos os seus achados.
 
-Responda sempre em português do Brasil.
+**Dados da Campanha (Formato CSV):**
+{data_from_bq}
+
+**Gere sua análise agora.**
 """
 
-SQL_GENERATOR_PROMPT = f"""Você é um expert em GoogleSQL (SQL do BigQuery). Sua única função é converter uma pergunta em linguagem natural em uma consulta SQL otimizada para uma tabela chamada `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`.
-
-O esquema da tabela é:
-{TABLE_SCHEMA_DESCRIPTION}
-
-**Regra de Ouro:** Use **EXCLUSIVAMENTE** os nomes de colunas fornecidos no esquema acima. Não infira ou utilize qualquer outro nome de coluna ou pseudo-coluna.
-
-**Filtro Fixo de Campanha:** Todas as consultas que você gerar DEVEM, obrigatoriamente, incluir o filtro `LOWER(Campanha) LIKE '%tododia-havana%'`. Se o usuário solicitar outros filtros (por plataforma, segmentação, etc.), adicione-os usando a cláusula `AND`.
-
-**Métricas Calculadas (Fórmulas):**
-- **CPM:** `(SUM(Cost) / SUM(Impressions)) * 1000`
-- **CTR:** `(SUM(Clicks) / SUM(Impressions)) * 100`
-- **CPC:** `(SUM(Cost) / SUM(Clicks))`
-- **CPView 100% ou CPV:** `(SUM(Cost) / SUM(VideoViews100))`
-- **VTR 100%:** `(SUM(VideoViews100) / SUM(Impressions)) * 100`
-
-**Regras de Geração:**
-1.  **Análise para Otimização:** Se a pergunta for sobre otimização ou comparação, retorne a métrica principal AGRUPADA pelas dimensões mais relevantes.
-2.  **Análise de Tendência:** Se a pergunta envolver "tendência" ou "evolução", agrupe a métrica por `DATE_TRUNC(data, MONTH)`. A coluna de data se chama `data`.
-3.  Responda APENAS com o código SQL.
-4.  **Filtros Flexíveis e Sinônimos:** Aplique filtros flexíveis (`LOWER(coluna) LIKE '%termo%'`) para: `Plataforma`, `Segmentacao` (sinônimos: audiência), `Canal`, `ObjetivoDeMidia`, `ObjetivodeComunicacao`, `PrecisionMkt` (sinônimos: precision, pm). Note que o filtro de `Campanha` já está fixo.
-5.  A data de hoje é {pd.Timestamp.now().strftime('%Y-%m-%d')}.
-
-Pergunta do usuário:
+# --- CONSULTA SQL FIXA E OTIMIZADA ---
+# Esta consulta busca os dados agregados pelas principais dimensões para a análise.
+FIXED_SQL_QUERY = f"""
+SELECT
+    Plataforma,
+    Segmentacao,
+    LinhaCriativa,
+    Formato,
+    SUM(Cost) as CustoTotal,
+    SUM(Impressions) as Impressoes,
+    SUM(Clicks) as Cliques,
+    SUM(VideoViews100) as ViewsCompletas
+FROM
+    `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+WHERE
+    LOWER(Campanha) LIKE '%{CAMPAIGN_FILTER}%'
+GROUP BY
+    Plataforma, Segmentacao, LinhaCriativa, Formato
 """
 
-# --- MODELOS GEMINI ---
-sql_model = genai.GenerativeModel('gemini-2.5-flash')
-analysis_model = genai.GenerativeModel(
-    'gemini-2.5-flash',
-    system_instruction=AGENT_PERSONA
-)
+# --- MODELO GEMINI ---
+analysis_model = genai.GenerativeModel('gemini-2.5-flash')
 
-# --- FUNÇÃO PRINCIPAL DO CHATBOT ---
+# --- FUNÇÃO PRINCIPAL (AGORA MUITO MAIS SIMPLES) ---
 @functions_framework.http
 def gemini_chat(request):
-    # (O restante da função continua exatamente o mesmo das versões anteriores)
     headers = {'Access-Control-Allow-Origin': '*','Access-Control-Allow-Methods': 'POST, OPTIONS','Access-Control-Allow-Headers': 'Content-Type'}
     if request.method == 'OPTIONS':
         return ('', 204, headers)
-    # ... (restante da função sem alterações)
+
+    try:
+        # ETAPA 1: Executar a consulta fixa no BigQuery
+        query_job = bigquery_client.query(FIXED_SQL_QUERY)
+        results = query_job.to_dataframe()
+        
+        if results.empty:
+            final_answer = f"Não encontrei dados para a campanha '{CAMPAIGN_FILTER}'."
+        else:
+            # ETAPA 2: Enviar os dados para o Gemini gerar os insights
+            data_as_string = results.to_csv(index=False)
+            analysis_prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+                campaign=CAMPAIGN_FILTER,
+                data_from_bq=data_as_string
+            )
+            final_response = analysis_model.generate_content(analysis_prompt)
+            final_answer = final_response.text
+
+        return jsonify({'text': final_answer})
+
+    except Exception as e:
+        print(f"Ocorreu um erro: {e}")
+        final_answer = "Desculpe, ocorreu um erro ao consultar o banco de dados e gerar os insights."
+        return jsonify({'text': final_answer}), 500
